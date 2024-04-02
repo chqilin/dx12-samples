@@ -41,6 +41,7 @@ using namespace DirectX;
 #include <string>
 #include <exception>
 #include <vector>
+#include <map>
 #include <codecvt>
 
 class HRException : public std::exception
@@ -75,6 +76,7 @@ const char* windowClass = "0003-Texture";
 const int windowWidth = 800;
 const int windowHeight = 600;
 
+const UINT frameBufferCount = 2;
 
 struct Vertex {
     XMFLOAT3 pos;
@@ -85,7 +87,7 @@ struct Vertex {
 class Graphics {
 
 public:
-    void init(HWND windowHandle, UINT frameBufferCount) {
+    void init(HWND windowHandle) {
         UINT dxgiFactoryFlags = 0U;
 
 #if defined(_DEBUG)
@@ -150,7 +152,7 @@ public:
         swapchainDesc.Windowed = TRUE;
         _ThrowIfFailed(mDXGIFactory->CreateSwapChain(mCommandQueue.Get(), &swapchainDesc, &swapchain));
         _ThrowIfFailed(swapchain.As(&mSwapChain));
-        mBackBufferIndex = mSwapChain->GetCurrentBackBufferIndex();
+        mFrameBufferIndex = mSwapChain->GetCurrentBackBufferIndex();
 
 
         // Create RTV Heap
@@ -171,6 +173,10 @@ public:
             rtvHandle.ptr += mRTVHeapStride;
         }
 
+        // Create Command Allocators
+        for (UINT i = 0; i < frameBufferCount; i++) {
+            _ThrowIfFailed(mDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&mCommandAllocators[i])));
+        }
     
         // Create SRV Heap
         D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
@@ -197,8 +203,9 @@ public:
         }
 
         // Create Fence
-        _ThrowIfFailed(mDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&mFence)));
-        mFenceValue = 1;
+        memset(mFenceValues, 0, sizeof(UINT64) * frameBufferCount);
+        _ThrowIfFailed(mDevice->CreateFence(mFenceValues[mFrameBufferIndex], D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&mFence)));
+        mFenceValues[mFrameBufferIndex]++;
         mFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         if (mFenceEvent == nullptr) {
             _ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
@@ -206,6 +213,8 @@ public:
 
         // Create Assets
         this->createAssets();
+
+        this->waitForGPU();
     }
 
     void quit() {
@@ -222,7 +231,7 @@ public:
 
         _ThrowIfFailed(mSwapChain->Present(1, 0));
 
-        this->waitForGPU();
+        this->waitForNextFrame();
     }
 
     void createAssets() {
@@ -342,9 +351,8 @@ public:
 
 
         // Create Command Allocator and Graphics Command List
-        _ThrowIfFailed(mDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&mCommandAllocator)));
         _ThrowIfFailed(mDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-            mCommandAllocator.Get(),
+            mCommandAllocators[mFrameBufferIndex].Get(),
             mPipelineState.Get(),
             IID_PPV_ARGS(&mCommandList)));
         
@@ -490,13 +498,11 @@ public:
         _ThrowIfFailed(mCommandList->Close());
         ID3D12CommandList* commandLists[] = { mCommandList.Get() };
         mCommandQueue->ExecuteCommandLists(_countof(commandLists), commandLists);
-
-        this->waitForGPU();
     }
 
     void fillCommandList() {
-        _ThrowIfFailed(mCommandAllocator->Reset());
-        _ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), mPipelineState.Get()));
+        _ThrowIfFailed(mCommandAllocators[mFrameBufferIndex]->Reset());
+        _ThrowIfFailed(mCommandList->Reset(mCommandAllocators[mFrameBufferIndex].Get(), mPipelineState.Get()));
 
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
@@ -509,14 +515,14 @@ public:
 
         D3D12_RESOURCE_BARRIER onBegin = {};
         onBegin.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        onBegin.Transition.pResource = mRenderTargets[mBackBufferIndex].Get();
+        onBegin.Transition.pResource = mRenderTargets[mFrameBufferIndex].Get();
         onBegin.Transition.Subresource = 0;
         onBegin.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         onBegin.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         mCommandList->ResourceBarrier(1, &onBegin);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle{ mRTVHeap->GetCPUDescriptorHandleForHeapStart() };
-        rtvHandle.ptr += mBackBufferIndex * mRTVHeapStride;
+        rtvHandle.ptr += mFrameBufferIndex * mRTVHeapStride;
         mCommandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
         const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
@@ -528,7 +534,7 @@ public:
 
         D3D12_RESOURCE_BARRIER onEnd = {};
         onEnd.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        onEnd.Transition.pResource = mRenderTargets[mBackBufferIndex].Get();
+        onEnd.Transition.pResource = mRenderTargets[mFrameBufferIndex].Get();
         onEnd.Transition.Subresource = 0;
         onEnd.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         onEnd.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -538,25 +544,31 @@ public:
     }
 
     void waitForGPU() {
-        // WAITING FOR THE FRAME TO COMPLETE BEFORE CONTINUING IS NOT BEST PRACTICE.
-        // This is code implemented as such for simplicity. The D3D12HelloFrameBuffering
-        // sample illustrates how to use fences for efficient resource usage and to
-        // maximize GPU utilization.
-    
-        // Signal and increment the fence value.
-        const UINT64 fence = mFenceValue;
-        _ThrowIfFailed(mCommandQueue->Signal(mFence.Get(), fence));
-        mFenceValue++;
+        const UINT64 currentFenceValue = mFenceValues[mFrameBufferIndex];
 
-        // Wait until the previous frame is finished.
+        _ThrowIfFailed(mCommandQueue->Signal(mFence.Get(), currentFenceValue));
+        
+        _ThrowIfFailed(mFence->SetEventOnCompletion(currentFenceValue, mFenceEvent));
+        WaitForSingleObject(mFenceEvent, INFINITE);
+        
+        mFenceValues[mFrameBufferIndex] = currentFenceValue + 1;
+    }
+
+    void waitForNextFrame() {
+        const UINT64 currentFenceValue = mFenceValues[mFrameBufferIndex];
+
+        _ThrowIfFailed(mCommandQueue->Signal(mFence.Get(), currentFenceValue));
+        
+        mFrameBufferIndex = mSwapChain->GetCurrentBackBufferIndex();
+
         const UINT completed = mFence->GetCompletedValue();
-        if (completed < fence)
+        if (completed < mFenceValues[mFrameBufferIndex])
         {
-            _ThrowIfFailed(mFence->SetEventOnCompletion(fence, mFenceEvent));
+            _ThrowIfFailed(mFence->SetEventOnCompletion(mFenceValues[mFrameBufferIndex], mFenceEvent));
             WaitForSingleObject(mFenceEvent, INFINITE);
         }
-
-        mBackBufferIndex = mSwapChain->GetCurrentBackBufferIndex();
+        
+        mFenceValues[mFrameBufferIndex] = currentFenceValue + 1;
     }
 
     void compileShader(const std::string& file, const char* target, const char* entry, ID3DBlob** code) {
@@ -721,7 +733,7 @@ private:
     ComPtr<ID3D12DebugDevice> mDebugDevice;
     ComPtr<ID3D12CommandQueue> mCommandQueue;
     ComPtr<IDXGISwapChain3> mSwapChain;
-    UINT mBackBufferIndex = 0;
+    UINT mFrameBufferIndex = 0;
     
     ComPtr<ID3D12DescriptorHeap> mRTVHeap;
     UINT mRTVHeapStride = 0;
@@ -733,12 +745,12 @@ private:
     UINT mSRVHeapStride = 0;
 
     ComPtr<ID3D12Fence> mFence;
-    UINT mFenceValue;
+    UINT64 mFenceValues[frameBufferCount];
     HANDLE mFenceEvent;
     
     ComPtr<ID3D12RootSignature> mRootSignature;
     ComPtr<ID3D12PipelineState> mPipelineState;
-    ComPtr<ID3D12CommandAllocator> mCommandAllocator;
+    ComPtr<ID3D12CommandAllocator> mCommandAllocators[frameBufferCount];
     ComPtr<ID3D12GraphicsCommandList> mCommandList;
     ComPtr<ID3D12Resource> mVertexBuffer;
     D3D12_VERTEX_BUFFER_VIEW mVertexBufferView;
@@ -800,7 +812,7 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance,
         UpdateWindow(hWnd);
 
         Graphics graphics;
-        graphics.init(hWnd, 2);
+        graphics.init(hWnd);
 
         MSG msg;
         msg.message = static_cast<UINT>(~WM_QUIT);
